@@ -5,7 +5,7 @@ import aiohttp
 import csv
 import json
 from datetime import datetime, timedelta
-from flask import Flask, send_file, jsonify, render_template_string
+from flask import Flask, send_file, jsonify, render_template_string, request
 import io
 import logging
 import gc
@@ -16,9 +16,25 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Get port from environment variable or default to 5000
+PORT = int(os.getenv('PORT', 5000))
+logger.info(f"Starting server on port {PORT}")
+
 # Redis configuration
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379')
-redis_client = redis.from_url(REDIS_URL)
+logger.info(f"Redis URL: {REDIS_URL}")
+
+try:
+    redis_client = redis.from_url(REDIS_URL)
+    # Test Redis connection
+    redis_client.ping()
+    logger.info("Redis connection successful")
+except redis.ConnectionError as e:
+    logger.error(f"Redis connection error: {e}")
+    redis_client = None
+except Exception as e:
+    logger.error(f"Unexpected Redis error: {e}")
+    redis_client = None
 
 # Binance API configuration
 BINANCE_API_URL = "https://api.binance.com/api/v3/klines"
@@ -83,20 +99,24 @@ def process_data(raw_data):
     
     processed_data = []
     for candle in raw_data:
-        processed_candle = {
-            'open_time': datetime.fromtimestamp(candle[0] / 1000).isoformat(),
-            'open': float(candle[1]),
-            'high': float(candle[2]),
-            'low': float(candle[3]),
-            'close': float(candle[4]),
-            'volume': float(candle[5]),
-            'close_time': datetime.fromtimestamp(candle[6] / 1000).isoformat(),
-            'quote_asset_volume': float(candle[7]),
-            'number_of_trades': int(candle[8]),
-            'taker_buy_base_asset_volume': float(candle[9]),
-            'taker_buy_quote_asset_volume': float(candle[10])
-        }
-        processed_data.append(processed_candle)
+        try:
+            processed_candle = {
+                'open_time': datetime.fromtimestamp(candle[0] / 1000).isoformat(),
+                'open': float(candle[1]),
+                'high': float(candle[2]),
+                'low': float(candle[3]),
+                'close': float(candle[4]),
+                'volume': float(candle[5]),
+                'close_time': datetime.fromtimestamp(candle[6] / 1000).isoformat(),
+                'quote_asset_volume': float(candle[7]),
+                'number_of_trades': int(candle[8]),
+                'taker_buy_base_asset_volume': float(candle[9]),
+                'taker_buy_quote_asset_volume': float(candle[10])
+            }
+            processed_data.append(processed_candle)
+        except (IndexError, ValueError, TypeError) as e:
+            logger.error(f"Error processing candle data: {e}, candle: {candle}")
+            continue
     
     # Sort by time
     processed_data.sort(key=lambda x: x['open_time'])
@@ -106,6 +126,10 @@ def process_data(raw_data):
 def save_to_redis(data):
     """Save processed data to Redis"""
     if data is None:
+        return False
+    
+    if redis_client is None:
+        logger.error("Cannot save to Redis: Redis client not available")
         return False
     
     try:
@@ -147,8 +171,11 @@ HTML_TEMPLATE = """
         .alert { padding: 15px; border-radius: 5px; margin-bottom: 20px; }
         .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .alert-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .alert-warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
         .btn { display: inline-block; padding: 10px 20px; background: #007bff; color: white; border-radius: 5px; }
         .btn:hover { background: #0056b3; text-decoration: none; }
+        .btn-warning { background: #ffc107; color: #000; }
+        .btn-warning:hover { background: #e0a800; }
     </style>
 </head>
 <body>
@@ -156,6 +183,13 @@ HTML_TEMPLATE = """
     
     {% if message %}
     <div class="alert alert-{{ message_type }}">{{ message }}</div>
+    {% endif %}
+    
+    {% if redis_status != "connected" %}
+    <div class="alert alert-warning">
+        <strong>Warning:</strong> Redis is not connected. Data will not be persisted.
+        {% if REDIS_URL %}Using Redis URL: {{ REDIS_URL }}{% endif %}
+    </div>
     {% endif %}
     
     {% if data_exists %}
@@ -167,6 +201,9 @@ HTML_TEMPLATE = """
     {% else %}
     <p>No data available. <a href="/refresh" class="btn">Click here to fetch data</a></p>
     {% endif %}
+    
+    <hr>
+    <p><small>Server running on port: {{ port }}</small></p>
 </body>
 </html>
 """
@@ -175,7 +212,7 @@ HTML_TEMPLATE = """
 def home():
     """Home page with download links"""
     redis_key = get_redis_key()
-    data_exists = redis_client.exists(redis_key)
+    data_exists = redis_client and redis_client.exists(redis_key)
     
     message = request.args.get('message')
     message_type = request.args.get('message_type', 'success')
@@ -183,54 +220,71 @@ def home():
     if data_exists:
         metadata_json = redis_client.get(f"{redis_key}:metadata")
         if metadata_json:
-            metadata = json.loads(metadata_json)
+            try:
+                metadata = json.loads(metadata_json)
+            except json.JSONDecodeError:
+                metadata = {'status': 'Error parsing metadata'}
         else:
             metadata = {'status': 'Data available but metadata missing'}
-        
-        return render_template_string(HTML_TEMPLATE, 
-                                    data_exists=True, 
-                                    metadata=metadata,
-                                    message=message,
-                                    message_type=message_type)
     else:
-        return render_template_string(HTML_TEMPLATE, 
-                                    data_exists=False,
-                                    message=message,
-                                    message_type=message_type)
+        metadata = {}
+    
+    return render_template_string(HTML_TEMPLATE, 
+                                data_exists=data_exists, 
+                                metadata=metadata,
+                                message=message,
+                                message_type=message_type,
+                                redis_status="connected" if redis_client else "disconnected",
+                                REDIS_URL=REDIS_URL,
+                                port=PORT)
 
 @app.route('/refresh')
 def refresh_data():
     """Trigger data refresh"""
     try:
-        # Run async function in background
-        asyncio.run(fetch_and_process_data())
-        return jsonify({'status': 'success', 'message': 'Data refresh started'})
+        # Run async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(fetch_and_process_data())
+        loop.close()
+        
+        return jsonify({'status': 'success', 'message': 'Data refresh completed'})
     except Exception as e:
+        logger.error(f"Error in refresh_data: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 async def fetch_and_process_data():
     """Main function to fetch and process data"""
     logger.info("Starting data fetch...")
-    raw_data = await fetch_historical_data()
-    logger.info(f"Fetched {len(raw_data)} total candles")
-    
-    processed_data = process_data(raw_data)
-    if processed_data is not None:
-        save_to_redis(processed_data)
-        logger.info("Data processing completed successfully")
-    else:
-        logger.error("Failed to process data")
+    try:
+        raw_data = await fetch_historical_data()
+        logger.info(f"Fetched {len(raw_data)} total candles")
+        
+        processed_data = process_data(raw_data)
+        if processed_data is not None:
+            save_to_redis(processed_data)
+            logger.info("Data processing completed successfully")
+        else:
+            logger.error("Failed to process data")
+    except Exception as e:
+        logger.error(f"Error in fetch_and_process_data: {e}")
 
 @app.route('/download/<format>')
 def download_data(format):
     """Download data in specified format"""
+    if not redis_client:
+        return "Redis not available. Cannot download data.", 500
+        
     redis_key = get_redis_key()
     data_json = redis_client.get(redis_key)
     
     if not data_json:
         return "Data not available. Please refresh first.", 404
     
-    data = json.loads(data_json)
+    try:
+        data = json.loads(data_json)
+    except json.JSONDecodeError:
+        return "Error parsing data. Please refresh.", 500
     
     filename = f"binance_{SYMBOL}_{INTERVAL}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     
@@ -283,11 +337,39 @@ def download_data(format):
 @app.route('/health')
 def health():
     """Health check endpoint"""
-    return jsonify({'status': 'healthy', 'timestamp': datetime.now().isoformat()})
+    redis_status = "connected" if redis_client else "disconnected"
+    return jsonify({
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'redis': redis_status,
+        'port': PORT
+    })
+
+@app.errorhandler(500)
+def internal_error(error):
+    """Handle 500 errors"""
+    logger.error(f"Server error: {error}")
+    return render_template_string("""
+        <h1>500 - Internal Server Error</h1>
+        <p>Something went wrong. Please try again later.</p>
+        <p><a href="/">Return to home</a></p>
+    """), 500
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 errors"""
+    return render_template_string("""
+        <h1>404 - Page Not Found</h1>
+        <p>The page you're looking for doesn't exist.</p>
+        <p><a href="/">Return to home</a></p>
+    """), 404
 
 if __name__ == '__main__':
     # Force garbage collection before starting
     gc.collect()
     
+    # Get port from environment variable or default to 5000
     port = int(os.getenv('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
+    
     app.run(host='0.0.0.0', port=port, debug=False)
