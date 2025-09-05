@@ -1,7 +1,4 @@
 flask==2.3.3
 redis==4.6.0
-pandas==2.0.3
 aiohttp==3.8.5
 asyncio==3.4.3
-pyarrow==13.0.0
-python-dotenv==1.0.0
